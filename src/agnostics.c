@@ -57,7 +57,7 @@ GtkTreeModel *stests;
 /* Inter-thread globals */
 
 gchar *test_name;
-gboolean cancelled;
+gboolean running, cancelled;
 int testpid;
 
 /* Path to log file */
@@ -68,7 +68,7 @@ gchar *logfile;
 
 static void log_init (void);
 static void log_message (const char *format, ...);
-static int find_tests (void);
+static void find_tests (void);
 static void parse_test_file (gchar *path);
 static gpointer test_thread (gpointer data);
 static int dialog_update (gpointer data);
@@ -91,7 +91,7 @@ static void log_init (void)
 
     // get version number of agnostics package
     sprintf (buffer, "(unknown)");
-    if (fp = popen ("apt-cache policy agnostics | grep Installed | cut -d : -f 2", "r"))
+    if ((fp = popen ("apt-cache policy agnostics | grep Installed | cut -d : -f 2", "r")))
     {
         if (!fgets (buffer, sizeof (buffer) - 1, fp)) sprintf (buffer, "(unknown)");
         pclose (fp);
@@ -102,7 +102,7 @@ static void log_init (void)
     tstr = localtime (&now);
 
     // write header, overwriting existing file
-    if (fp = fopen (logfile, "w"))
+    if ((fp = fopen (logfile, "w")))
     {
         fprintf (fp, "Raspberry Pi Diagnostics - version %s\n%s\n", g_strstrip (buffer), asctime (tstr));
         fclose (fp);
@@ -121,7 +121,7 @@ static void log_message (const char *format, ...)
     vsprintf (buffer, format, args);
     va_end (args);
 
-    if (fp = fopen (logfile, "a"))
+    if ((fp = fopen (logfile, "a")))
     {
         fprintf (fp, "%s\n", buffer);
         fclose (fp);
@@ -130,7 +130,7 @@ static void log_message (const char *format, ...)
 
 /* Find all test files in the data directory and add them to the tests list store */
 
-static int find_tests (void)
+static void find_tests (void)
 {
     GDir *data_dir;
     const gchar *name;
@@ -259,7 +259,7 @@ static gpointer test_thread (gpointer data)
                 setpgid (testpid, testpid);
 
                 // wait for child process to end
-                wait (&status);
+                waitpid (testpid, &status, 0);
 
                 if (cancelled)
                 {
@@ -284,6 +284,7 @@ static gpointer test_thread (gpointer data)
 
     g_free (test_name);
     test_name = NULL;
+    running = FALSE;
 
     // restore stdout and stderr
     dup2 (stdo, STDOUT_FILENO);
@@ -298,12 +299,12 @@ static int dialog_update (gpointer data)
 {
     gchar *buffer;
 
-    if (test_name)
+    if (running)
     {
         if (cancelled)
             buffer = g_strdup_printf (_("Cancelling..."));
         else
-            buffer = g_strdup_printf (_("Running %s..."), test_name);
+            buffer = g_strdup_printf (_("Running %s..."), test_name ? test_name : _("tests"));
         gtk_label_set_text (GTK_LABEL (msg_label), buffer);
         g_free (buffer);
         gtk_progress_bar_pulse (GTK_PROGRESS_BAR (msg_prog));
@@ -322,8 +323,9 @@ static int dialog_update (gpointer data)
 static void run_test (GtkWidget *wid, gpointer data)
 {
     // setting transient in the UI file doesn't work - but then, logically, it can't...
+    gtk_label_set_text (GTK_LABEL (msg_label), _("Running tests..."));
     gtk_window_set_transient_for (GTK_WINDOW (msg_wd), GTK_WINDOW (piag_wd));
-    gtk_widget_show_all (GTK_WIDGET (msg_wd));
+    gtk_widget_show (GTK_WIDGET (msg_wd));
 
     // add a timer to update the dialog
     gdk_threads_add_timeout (1000, dialog_update, NULL);
@@ -331,6 +333,7 @@ static void run_test (GtkWidget *wid, gpointer data)
     // launch a thread with the system call to run the tests
     cancelled = FALSE;
     test_name = NULL;
+    running = TRUE;
     g_thread_new (NULL, test_thread, NULL);
 }
 
@@ -356,11 +359,11 @@ static void reset_test (GtkWidget *wid, gpointer data)
 
 static void show_log (GtkWidget *wid, gpointer data)
 {
-    char *buffer;
-
-    buffer = g_strdup_printf ("mousepad %s &", logfile);
-    system (buffer);
-    g_free (buffer);
+    if (fork () == 0)
+    {
+        execl ("/usr/bin/xdg-open", "xdg-open", logfile, NULL);
+        exit (0);
+    }
 }
 
 /* Handler for click on tree view check box */
@@ -412,6 +415,7 @@ int main (int argc, char *argv[])
 {
     GtkBuilder *builder;
     GtkCellRenderer *crt, *crb, *crr;
+    GtkWidget *wid;
 
 #ifdef ENABLE_NLS
     setlocale (LC_ALL, "");
@@ -432,8 +436,7 @@ int main (int argc, char *argv[])
     logfile = g_build_filename (g_get_home_dir (), "rpdiags.txt", NULL);
 
     // load widgets from UI file
-    builder = gtk_builder_new ();
-    gtk_builder_add_from_file (builder, PACKAGE_UI_DIR "/agnostics.ui", NULL);
+    builder = gtk_builder_new_from_file (PACKAGE_UI_DIR "/agnostics.ui");
 
     piag_wd = (GtkWidget *) gtk_builder_get_object (builder, "piag_wd");
     piag_tv = (GtkWidget *) gtk_builder_get_object (builder, "piag_tv");
@@ -442,10 +445,12 @@ int main (int argc, char *argv[])
     btn_reset = (GtkWidget *) gtk_builder_get_object (builder, "btn_reset");
     btn_log = (GtkWidget *) gtk_builder_get_object (builder, "btn_log");
 
-    msg_wd = (GtkWidget *) gtk_builder_get_object (builder, "msg_wd");
-    msg_label = (GtkWidget *) gtk_builder_get_object (builder, "msg_label");
-    msg_prog = (GtkWidget *) gtk_builder_get_object (builder, "msg_prog");
-    msg_btn = (GtkWidget *) gtk_builder_get_object (builder, "msg_btn");
+    msg_wd = (GtkWidget *) gtk_builder_get_object (builder, "modal");
+    msg_label = (GtkWidget *) gtk_builder_get_object (builder, "modal_msg");
+    msg_prog = (GtkWidget *) gtk_builder_get_object (builder, "modal_pb");
+    msg_btn = (GtkWidget *) gtk_builder_get_object (builder, "modal_cancel");
+    wid = (GtkWidget *) gtk_builder_get_object (builder, "modal_ok");
+    gtk_widget_hide (wid);
     g_object_unref (builder);
 
     // set up tree view
